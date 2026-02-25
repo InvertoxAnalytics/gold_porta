@@ -1151,7 +1151,7 @@ def min_var_weights_unconstrained(cov: pd.DataFrame) -> pd.Series:
     except np.linalg.LinAlgError:
         inv = np.linalg.pinv(cov_)
     w = inv @ ones
-    w = w / float(ones.T @ inv @ ones)
+    w = w / (ones.T @ inv @ ones).item()
     return pd.Series(w.flatten(), index=cov.index)
 
 
