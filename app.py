@@ -458,7 +458,7 @@ def load_and_prepare_bytes(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict]:
         cols = ["Symbol", "Date", "Time", "Open", "High", "Low", "Close", "Volume"]
         bio.seek(0)
         df = pd.read_csv(bio, names=cols, header=None,
-                         delim_whitespace=True, encoding=enc)
+                         sep=r"\s+", engine="python", encoding=enc)
         dt_utc = pd.to_datetime(
             df["Date"].astype(str) + df["Time"].astype(str),
             format="%Y%m%d%H%M%S", utc=True, errors="coerce",
