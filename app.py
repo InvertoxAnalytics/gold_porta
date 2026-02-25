@@ -2245,9 +2245,9 @@ if not SIMPLE:
             mc_c1, mc_c2 = st.columns(2)
             mc_lot0 = mc_c1.number_input("LOT0", 0.01, 5.0, 0.01, 0.01, key="mc_lot0")
             mc_q = mc_c1.number_input("Factor q", 1.01, 2.0, 1.10, 0.01, key="mc_q")
-            mc_dist = mc_c1.number_input("Distance", 0.001, 1000.0,
+            mc_dist = mc_c1.number_input("Distance", 0.0001, 1000.0,
                                           float(preset_mc["mc_distance"]), key="mc_dist")
-            mc_tp = mc_c2.number_input("TP offset", 0.001, 1000.0,
+            mc_tp = mc_c2.number_input("TP offset", 0.0001, 1000.0,
                                         float(preset_mc["mc_tp_offset"]), key="mc_tp")
             mc_sl = mc_c2.number_input("STOP-loss (USD<0)", -500_000.0, -1.0,
                                         float(preset_mc["mc_stop_loss"]), 1000.0, key="mc_sl")
