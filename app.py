@@ -47,6 +47,14 @@ from typing import Dict, Tuple, Optional, List
 from dotenv import load_dotenv
 load_dotenv()
 
+
+def get_groq_api_key() -> str:
+    """Lee GROQ_API_KEY desde .env (local) o desde Streamlit Secrets (Cloud)."""
+    return (
+        os.getenv("GROQ_API_KEY")
+        or st.secrets.get("GROQ_API_KEY", "")
+    ).strip()
+
 import numpy as np
 import pandas as pd
 import pytz
@@ -2055,9 +2063,9 @@ def analyze_news_groq(articles: list, symbols: list, tech_context: str = "") -> 
     - Obliga a cruzar fundamental vs técnico antes de emitir señal
     - temperature=0.1 para máxima consistencia
     """
-    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    api_key = get_groq_api_key()
     if not api_key:
-        return "⚠️ No se encontró GROQ_API_KEY en el archivo .env"
+        return "⚠️ No se encontró GROQ_API_KEY. Agrégala en .env (local) o en Manage app → Secrets (Streamlit Cloud)."
     if not GROQ_OK:
         return "⚠️ Instala el paquete 'groq': pip install groq"
 
@@ -2761,11 +2769,13 @@ with tab_news:
         st.warning("Falta el paquete de IA. Ejecuta: `pip install groq`")
 
     # ── Aviso de API key ─────────────────────────────────────────────────────
-    _api_key_present = bool(os.getenv("GROQ_API_KEY", "").strip())
+    _api_key_present = bool(get_groq_api_key())
     if not _api_key_present:
         st.error(
-            "No se encontró GROQ_API_KEY en el archivo .env. "
-            "Agrega tu key y reinicia la app."
+            "No se encontró GROQ_API_KEY. "
+            "**Local:** agrégala en el archivo `.env`. "
+            "**Streamlit Cloud:** ve a Manage app → Settings → Secrets y agrega: "
+            "`GROQ_API_KEY = \"tu_key_aqui\"`. Luego reinicia la app."
         )
 
     # ── Info sobre Jina Reader ───────────────────────────────────────────────
