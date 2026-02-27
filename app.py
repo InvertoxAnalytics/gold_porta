@@ -429,11 +429,26 @@ def first_line_text(b: bytes, enc: str) -> str:
 
 
 def infer_symbol_from_filename(name: str) -> str:
-    """Extrae símbolo del nombre de archivo. Ej: 'XAUUSD_M1.csv' → 'XAUUSD'."""
+    """Extrae símbolo del nombre de archivo.
+
+    Ejemplos:
+      'XAUUSD_M1.csv'         → 'XAUUSD'
+      'OANDA_EURUSD, 1D.csv'  → 'EURUSD'  (salta prefijo de broker)
+    """
+    # Prefijos de broker conocidos que hay que ignorar
+    _BROKER_PREFIXES = {"OANDA", "FXCM", "IC", "PEPPERSTONE", "XM", "TICKMILL"}
+
     base = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
     base = base.rsplit(".", 1)[0].strip()
-    sym = base.split("_")[0].upper()
-    sym = re.split(r"[,\s;()\-]+", sym)[0]
+    parts = base.split("_")
+
+    # Si el primer token es un prefijo de broker, usar el siguiente
+    if len(parts) > 1 and parts[0].upper() in _BROKER_PREFIXES:
+        candidate = parts[1]
+    else:
+        candidate = parts[0]
+
+    sym = re.split(r"[,\s;()\-]+", candidate)[0]
     return sym.upper()
 
 
@@ -453,14 +468,32 @@ def load_and_prepare_bytes(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict]:
     Y un dict con metadatos de parsing."""
     enc = detect_encoding(file_bytes)
     head = first_line_text(file_bytes, enc)
-    is_csv = head.startswith("<DATE>")
+    is_mt5_std  = head.startswith("<DATE>")
+    is_oanda    = head.lower().startswith("time,open")
 
-    info = {"encoding": enc, "hdr": "<DATE>" if is_csv else "other",
-            "sep": None, "note": ""}
+    info = {"encoding": enc, "hdr": "auto", "sep": None, "note": ""}
     bio = io.BytesIO(file_bytes)
 
-    if is_csv:
-        # Formato MT5 estándar con headers <DATE> <TIME> etc.
+    if is_oanda:
+        # ── Formato OANDA: time (Unix timestamp), open, high, low, close, ATR, ADR
+        bio.seek(0)
+        df = pd.read_csv(bio, sep=",", encoding=enc)
+        df.columns = [c.strip().lower() for c in df.columns]
+        df = df.rename(columns={
+            "open": "Open", "high": "High",
+            "low": "Low",  "close": "Close",
+        })
+        # Unix timestamp (segundos) → UTC
+        dt_utc = pd.to_datetime(df["time"], unit="s", utc=True, errors="coerce")
+        df = df.assign(datetime_utc=dt_utc).dropna(subset=["datetime_utc"])
+        # OANDA no trae volumen — ponemos cero para no romper el pipeline
+        df["Volume"] = 0
+        info["hdr"] = "oanda"
+        info["sep"] = ","
+        info["note"] = "Formato OANDA (Unix timestamp). Volumen no disponible."
+
+    elif is_mt5_std:
+        # ── Formato MT5 estándar con headers <DATE> <TIME> etc.
         df = None
         # Intento 1: separador TAB
         try:
@@ -482,8 +515,10 @@ def load_and_prepare_bytes(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict]:
             format="%Y.%m.%d %H:%M:%S", utc=True, errors="coerce",
         )
         df = df.assign(datetime_utc=dt_utc).dropna(subset=["datetime_utc"])
+        info["hdr"] = "<DATE>"
+
     else:
-        # Formato alternativo sin headers (símbolo embebido en la línea)
+        # ── Formato MT5 alternativo sin headers (símbolo embebido en la línea)
         cols = ["Symbol", "Date", "Time", "Open", "High", "Low", "Close", "Volume"]
         bio.seek(0)
         df = pd.read_csv(bio, names=cols, header=None,
@@ -493,6 +528,7 @@ def load_and_prepare_bytes(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict]:
             format="%Y%m%d%H%M%S", utc=True, errors="coerce",
         )
         df = df.assign(datetime_utc=dt_utc).dropna(subset=["datetime_utc"])
+        info["hdr"] = "other"
 
     # Asegurar columnas numéricas
     df = _safe_numeric(df, ["Open", "High", "Low", "Close", "Volume"])
@@ -1579,14 +1615,22 @@ def process_files(files_list, overrides_map):
         sym = overrides_map.get(f.name, infer_symbol_from_filename(f.name))
         raw, info = load_and_prepare_bytes(f.getvalue())
         x = to_indexed_ohlcv(raw)
+        dt   = infer_dt(x.index) if not x.empty else None
+        tf   = timeframe_label(dt)
         if not x.empty:
             if sym in series_raw:
-                comb = pd.concat([series_raw[sym], x]).sort_index()
-                comb = comb[~comb.index.duplicated(keep="last")]
-                series_raw[sym] = comb
+                tf_existing = timeframe_label(infer_dt(series_raw[sym].index))
+                if tf_existing == tf or tf == "—" or tf_existing == "—":
+                    # Misma temporalidad → combinar (ej. mismo activo en dos archivos)
+                    comb = pd.concat([series_raw[sym], x]).sort_index()
+                    comb = comb[~comb.index.duplicated(keep="last")]
+                    series_raw[sym] = comb
+                else:
+                    # Temporalidad distinta → separar con sufijo para no mezclar
+                    sym = f"{sym}_{tf}"
+                    series_raw[sym] = x
             else:
                 series_raw[sym] = x
-        dt = infer_dt(x.index) if not x.empty else None
         meta_rows.append({
             "Archivo": f.name, "Símbolo": sym,
             "Barras": int(len(x)),
@@ -1652,7 +1696,24 @@ st.sidebar.header("Paso 2 — Configura rango")
 
 modo_estricto = st.sidebar.checkbox("Exigir misma temporalidad", value=True)
 if modo_estricto and len(unique_labels) > 1:
-    st.error(f"Temporalidades: {unique_labels}. En modo estricto deben ser iguales.")
+    # Determina la temporalidad mayoritaria y los activos que no la cumplen
+    from collections import Counter
+    tf_counter  = Counter(dt_labels)
+    tf_mayoría  = tf_counter.most_common(1)[0][0]
+    infractores = [
+        f"**{s}** ({dt_labels[i]})"
+        for i, s in enumerate(symbols_all)
+        if dt_labels[i] != tf_mayoría and dt_labels[i] != "—"
+    ]
+    st.error(
+        f"❌ **Temporalidades mezcladas** — en modo estricto todos los activos "
+        f"deben tener la misma.\n\n"
+        f"Temporalidad mayoritaria: **{tf_mayoría}**\n\n"
+        f"{'Activo que no cumple:' if len(infractores) == 1 else 'Activos que no cumplen:'} "
+        f"{', '.join(infractores)}\n\n"
+        f"**Opciones:** elimina ese archivo, renómbralo con el override de símbolo, "
+        f"o desmarca *Exigir misma temporalidad* en el sidebar."
+    )
     st.stop()
 
 st.sidebar.caption(f"Rango global: {gmin:%Y-%m-%d} → {gmax:%Y-%m-%d}")
