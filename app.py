@@ -435,8 +435,13 @@ def infer_symbol_from_filename(name: str) -> str:
       'XAUUSD_M1.csv'         → 'XAUUSD'
       'OANDA_EURUSD, 1D.csv'  → 'EURUSD'  (salta prefijo de broker)
     """
-    # Prefijos de broker conocidos que hay que ignorar
-    _BROKER_PREFIXES = {"OANDA", "FXCM", "IC", "PEPPERSTONE", "XM", "TICKMILL"}
+    # Prefijos de broker/exchange conocidos que hay que ignorar
+    _BROKER_PREFIXES = {
+        "OANDA", "FXCM", "IC", "PEPPERSTONE", "XM", "TICKMILL",
+        "COINBASE", "BINANCE", "BLACKBULL", "VANTAGE", "KRAKEN",
+        "BYBIT", "EXNESS", "ROBOFOREX", "AVATRADE", "FP", "FOREXCOM",
+        "CAPITALCOM", "EIGHTCAP", "ICMARKETS", "GLOBALPRIME",
+    }
 
     base = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
     base = base.rsplit(".", 1)[0].strip()
@@ -483,14 +488,33 @@ def load_and_prepare_bytes(file_bytes: bytes) -> Tuple[pd.DataFrame, Dict]:
             "open": "Open", "high": "High",
             "low": "Low",  "close": "Close",
         })
-        # Unix timestamp (segundos) → UTC
-        dt_utc = pd.to_datetime(df["time"], unit="s", utc=True, errors="coerce")
+        # Parse de tiempo: puede venir en segundos, milisegundos o ISO.
+        # Soporta columnas mixtas (filas numéricas + filas ISO) sin perder datos.
+        _t_raw = df["time"]
+        _t_num = pd.to_numeric(_t_raw, errors="coerce")
+        if _t_num.notna().any():
+            _median_ts = float(_t_num.median())
+            _ts_unit = "ms" if _median_ts > 1e12 else "s"
+            dt_utc = pd.to_datetime(_t_num, unit=_ts_unit, utc=True, errors="coerce")
+            _mask_iso = _t_num.isna()
+            if _mask_iso.any():
+                dt_utc.loc[_mask_iso] = pd.to_datetime(
+                    _t_raw[_mask_iso], utc=True, errors="coerce"
+                )
+        else:
+            _ts_unit = "iso"
+            dt_utc = pd.to_datetime(_t_raw, utc=True, errors="coerce")
+
         df = df.assign(datetime_utc=dt_utc).dropna(subset=["datetime_utc"])
-        # OANDA no trae volumen — ponemos cero para no romper el pipeline
-        df["Volume"] = 0
+
+        # Volumen: OANDA casi siempre no trae (o viene en otra columna). Si existe, úsalo.
+        if "volume" in df.columns and "Volume" not in df.columns:
+            df = df.rename(columns={"volume": "Volume"})
+        if "Volume" not in df.columns:
+            df["Volume"] = 0
         info["hdr"] = "oanda"
         info["sep"] = ","
-        info["note"] = "Formato OANDA (Unix timestamp). Volumen no disponible."
+        info["note"] = f"Formato time,open (unit={_ts_unit}). " + ("Volumen no disponible." if df["Volume"].fillna(0).sum() == 0 else "Volumen detectado.")
 
     elif is_mt5_std:
         # ── Formato MT5 estándar con headers <DATE> <TIME> etc.
@@ -1360,7 +1384,7 @@ def build_executive_insights(summary, week_sev, reco, start, end) -> List[str]:
     return bullets
 
 
-def compute_portfolio_metrics_from_reco(rets_df, reco, trading_days) -> dict:
+def compute_portfolio_metrics_from_reco(rets_df, reco, trading_days, min_obs: int = 200) -> dict:
     """Calcula métricas del portafolio recomendado."""
     out = {"vol": np.nan, "sharpe": np.nan, "maxdd": np.nan}
     if rets_df is None or rets_df.empty:
@@ -1373,7 +1397,7 @@ def compute_portfolio_metrics_from_reco(rets_df, reco, trading_days) -> dict:
     if len(common) < 2:
         return out
     R = rets_df[common].dropna(how="any")
-    if R.shape[0] < 200:
+    if R.shape[0] < min_obs:
         return out
     ww = w.reindex(common).astype(float)
     ww = ww / ww.sum()
@@ -1637,7 +1661,7 @@ def process_files(files_list, overrides_map):
             "Desde": x.index.min().strftime("%Y-%m-%d %H:%M") if not x.empty else "—",
             "Hasta": x.index.max().strftime("%Y-%m-%d %H:%M") if not x.empty else "—",
             "Temporalidad": timeframe_label(dt),
-            "Enc": info["encoding"], "Sep": info["sep"],
+            "Enc": info["encoding"], "Sep": info["sep"], "Hdr": info.get("hdr",""), "Nota": info.get("note",""),
         })
     meta_df = pd.DataFrame(meta_rows)
     if not series_raw:
@@ -1741,6 +1765,7 @@ with st.sidebar.expander("⚙️ Ajustes avanzados", expanded=not SIMPLE):
     trend_lookback_days = st.slider("Lookback % Tend/% Lat (días)", 30, 365, 180)
     roll_vol_days = st.slider("Vol rolling (días)", 1, 180, 30)
     roll_corr_days = st.slider("Rolling corr (días)", 1, 365, 90)
+    corr_min_periods = st.slider("Mín. barras para correlación (min_periods)", 10, 500, 200)
     top_dd = st.selectbox("Top drawdowns", [3, 5, 10, 15], index=2)
     top_peaks = st.selectbox("Top picos vol", [5, 10, 20, 30], index=1)
     min_new_high = st.slider("Ignorar micro-peaks (%)", 0.0, 1.0, 0.20, 0.05) / 100.0
@@ -1778,6 +1803,9 @@ def run_analysis(series_raw_, params_):
         data[s] = df.loc[m].copy()
 
     symbols = [s for s in sorted(data.keys()) if not data[s].empty]
+    # min_periods para correlación/portafolio (y umbral para incluir retornos)
+    min_periods_corr = int(params_.get("corr_min_periods", 200))
+    min_rets_bars = max(50, min_periods_corr + 1)
     metrics_rows, rets, week_rows = [], {}, []
 
     for s in symbols:
@@ -1788,7 +1816,7 @@ def run_analysis(series_raw_, params_):
             m["Símbolo"] = s
             metrics_rows.append(m)
         close = data[s]["Close"].dropna()
-        if close.shape[0] >= 200:
+        if close.shape[0] >= min_rets_bars:
             rets[s] = np.log(close).diff()
         wk = this_week_summary(data[s], trading_days=params_["trading_days"])
         if wk:
@@ -1800,6 +1828,56 @@ def run_analysis(series_raw_, params_):
     summary = pd.DataFrame(metrics_rows).set_index("Símbolo") if metrics_rows else pd.DataFrame()
     weekdf = pd.DataFrame(week_rows).set_index("Símbolo") if week_rows else pd.DataFrame()
     rets_df = pd.DataFrame(rets) if rets else pd.DataFrame()
+
+    # ── Correlación: decidir si alinear a diario ─────────────────────────────
+    # Problema típico: incluso 1D vs 1D puede no alinear si cada broker pone distinta hora de cierre.
+    _tfs_in_run = set()
+    _tf_map = {}
+    _close_tod = {}
+    for s in list(rets_df.columns):
+        _idx = data[s]["Close"].dropna().index
+        _dt = infer_dt(_idx) if len(_idx) > 10 else None
+        _tf = timeframe_label(_dt)
+        _tf_map[s] = _tf
+        if _tf != "—":
+            _tfs_in_run.add(_tf)
+        if len(_idx) > 0:
+            _mins = (_idx.hour * 60 + _idx.minute)
+            _mode = pd.Series(_mins).mode()
+            _close_tod[s] = int(_mode.iloc[0]) if not _mode.empty else None
+
+    mixed_tf = len(_tfs_in_run) > 1
+    has_daily = any(tf in {"1D", "W1", "MN1"} for tf in _tfs_in_run)
+
+    _low_overlap = False
+    _overlap_ratio = 1.0
+    if not rets_df.empty and rets_df.shape[1] >= 2:
+        _total = rets_df.shape[0]
+        _all_valid = rets_df.dropna(how="any").shape[0]
+        _overlap_ratio = (_all_valid / _total) if _total > 0 else 1.0
+        if _overlap_ratio < 0.30:
+            _low_overlap = True
+
+    corr_daily_mode = bool(mixed_tf or has_daily or _low_overlap)
+    corr_daily_reason = []
+    if mixed_tf:
+        corr_daily_reason.append("temporalidades mixtas")
+    if has_daily:
+        corr_daily_reason.append("incluye barras diarias/semanales (hora de cierre varía por broker)")
+    if _low_overlap:
+        corr_daily_reason.append(f"poco traslape intradía ({_overlap_ratio:.0%} de filas completas)")
+
+    if corr_daily_mode and not rets_df.empty:
+        # Resamplear TODOS los activos a diario (último close del día).
+        # Esto alinea 1D-vs-1D con horas distintas, y H1-vs-1D sin que quede 99% NaN.
+        _rets_daily = {}
+        for s in list(rets_df.columns):
+            close_d = data[s]["Close"].dropna().resample("1D").last().dropna()
+            if close_d.shape[0] >= 2:
+                _rets_daily[s] = np.log(close_d).diff()
+        rets_df_daily = pd.DataFrame(_rets_daily) if _rets_daily else rets_df.copy()
+    else:
+        rets_df_daily = rets_df.copy()
 
     if not summary.empty:
         def pct_rank(x, asc=True):
@@ -1823,12 +1901,12 @@ def run_analysis(series_raw_, params_):
             tmp["Severidad"] += (np.log(tmp["Vol ratio vs MA"]).abs()).replace([np.inf, -np.inf], 0.0).fillna(0.0)
         week_sev = tmp.sort_values("Severidad", ascending=False)
 
-    corr = rets_df.corr(min_periods=200) if (not rets_df.empty and rets_df.shape[1] >= 2) else pd.DataFrame()
+    corr = rets_df_daily.corr(min_periods=min_periods_corr) if (not rets_df_daily.empty and rets_df_daily.shape[1] >= 2) else pd.DataFrame()
     clusters = cluster_labels_from_corr(corr, k=params_["portfolio_k"]) if not corr.empty else None
 
     # Portafolio recomendado
     reco = {"selected": [], "weights": pd.Series(dtype=float), "note": ""}
-    if not rets_df.empty and not summary.empty and rets_df.shape[1] >= 2:
+    if not rets_df_daily.empty and not summary.empty and rets_df_daily.shape[1] >= 2:
         selected = []
         if clusters is not None and SCIPY_OK and corr.shape[0] >= 3:
             for cl in sorted(clusters.unique()):
@@ -1841,8 +1919,8 @@ def run_analysis(series_raw_, params_):
         else:
             selected = summary["Score"].sort_values(ascending=False).index.tolist()[:min(5, len(summary))]
         selected = list(dict.fromkeys(selected))
-        R = rets_df[selected].dropna(how="any")
-        if R.shape[0] >= 200 and R.shape[1] >= 2:
+        R = rets_df_daily[selected].dropna(how="any")
+        if R.shape[0] >= min_periods_corr and R.shape[1] >= 2:
             cov = shrink_cov(R.cov(), lam=0.10, jitter=1e-10)
             w = risk_parity_weights(cov).sort_values(ascending=False)
             reco = {"selected": selected, "weights": w, "note": "Risk Parity (long-only) sobre cov shrink."}
@@ -1850,10 +1928,44 @@ def run_analysis(series_raw_, params_):
             reco = {"selected": selected, "weights": pd.Series(dtype=float), "note": "Poco traslape para pesos robustos."}
 
     risk_df = build_risk_table(summary)
+    
+    # ── Debug (para explicar "cuadros vacíos" sin adivinar) ───────────────────
+    debug_rows = []
+    for s in symbols:
+        df_s = data[s]
+        close = df_s["Close"].dropna()
+        idx = close.index
+        tf = _tf_map.get(s, timeframe_label(infer_dt(idx) if len(idx) > 10 else None))
+        tod = _close_tod.get(s)
+        close_tod_str = f"{tod//60:02d}:{tod%60:02d}" if tod is not None else "—"
+        n_rets = int(rets.get(s, pd.Series(dtype=float)).dropna().shape[0]) if isinstance(rets, dict) else 0
+        n_rets_base = int(rets_df_daily[s].dropna().shape[0]) if (not rets_df_daily.empty and s in rets_df_daily.columns) else 0
+        vol_total = float(df_s["Volume"].fillna(0).sum()) if "Volume" in df_s.columns else float("nan")
+        vol_all0 = bool((df_s["Volume"].fillna(0) == 0).all()) if "Volume" in df_s.columns else True
+        debug_rows.append({
+            "Símbolo": s,
+            "TF": tf,
+            "Barras (rango)": int(len(df_s)),
+            "Retornos": n_rets,
+            "Retornos corr-base": n_rets_base,
+            "Desde": idx.min() if len(idx) else pd.NaT,
+            "Hasta": idx.max() if len(idx) else pd.NaT,
+            "Hora cierre (moda)": close_tod_str,
+            "Volumen total": vol_total,
+            "Volumen todo 0": vol_all0,
+        })
+    debug_corr = pd.DataFrame(debug_rows).set_index("Símbolo") if debug_rows else pd.DataFrame()
+
     return {
         "data": data, "symbols": symbols, "summary": summary,
         "risk_df": risk_df, "weekdf": weekdf, "week_sev": week_sev,
-        "rets_df": rets_df, "corr": corr, "clusters": clusters,
+        "rets_df": rets_df,
+        "rets_df_daily": rets_df_daily,
+        "mixed_tf": mixed_tf,
+        "corr_daily_mode": corr_daily_mode,
+        "corr_daily_reason": corr_daily_reason,
+        "debug_corr": debug_corr,
+        "corr": corr, "clusters": clusters,
         "reco_portfolio": reco,
     }
 
@@ -1863,6 +1975,7 @@ params = {
     "trading_days": int(trading_days), "trend_win": int(trend_win),
     "trend_lookback_days": int(trend_lookback_days),
     "roll_vol_days": int(roll_vol_days), "roll_corr_days": int(roll_corr_days),
+    "corr_min_periods": int(corr_min_periods),
     "top_dd": int(top_dd), "top_peaks": int(top_peaks),
     "min_new_high": float(min_new_high), "min_dd_event": float(min_dd_event),
     "use_common_for_corr": bool(use_common_for_corr),
@@ -1897,16 +2010,33 @@ risk_df = res["risk_df"]
 weekdf = res["weekdf"]
 week_sev = res["week_sev"]
 rets_df = res["rets_df"]
+rets_df_daily = res.get("rets_df_daily", rets_df)
+mixed_tf = res.get("mixed_tf", False)
+corr_daily_mode = res.get("corr_daily_mode", mixed_tf)
+corr_daily_reason = res.get("corr_daily_reason", [])
+debug_corr = res.get("debug_corr", pd.DataFrame())
 reco = res.get("reco_portfolio", {"selected": [], "weights": pd.Series(dtype=float), "note": ""})
 
 if not symbols:
     st.warning("No hay datos en el rango seleccionado.")
     st.stop()
 
-if use_common_for_corr and not rets_df.empty:
-    rets_df_corr = rets_df.loc[(rets_df.index >= common_start) & (rets_df.index <= common_end)].copy()
+# Para correlación y portafolio, usar base diaria cuando aplique (alineada entre brokers/formatos)
+_base_corr = rets_df_daily
+if use_common_for_corr and not _base_corr.empty:
+    if corr_daily_mode:
+        # Al estar en base diaria, comparar por fechas evita perder borde por hora exacta.
+        _common_start = pd.Timestamp(common_start).floor("D")
+        _common_end = pd.Timestamp(common_end).ceil("D")
+        rets_df_corr = _base_corr.loc[
+            (_base_corr.index >= _common_start) & (_base_corr.index <= _common_end)
+        ].copy()
+    else:
+        rets_df_corr = _base_corr.loc[
+            (_base_corr.index >= common_start) & (_base_corr.index <= common_end)
+        ].copy()
 else:
-    rets_df_corr = rets_df
+    rets_df_corr = _base_corr
 
 
 # ╔══════════════════════════════════════════════════════════════════════════════
@@ -2359,7 +2489,7 @@ with tab_exec:
         st.success(f"Selección: **{', '.join(reco['selected'])}**")
         if reco.get("weights") is not None and not reco["weights"].empty:
             st.dataframe(reco["weights"].to_frame("Peso"), use_container_width=True)
-        pm = compute_portfolio_metrics_from_reco(rets_df_corr, reco, trading_days)
+        pm = compute_portfolio_metrics_from_reco(rets_df_corr, reco, trading_days, min_obs=corr_min_periods)
         c1, c2, c3 = st.columns(3)
         c1.metric("Vol anual (port)", fmt_pct(pm["vol"]))
         c2.metric("Sharpe (port)", f"{pm['sharpe']:.2f}" if pd.notna(pm["sharpe"]) else "—")
@@ -2376,7 +2506,7 @@ with tab_exec:
         col_d2.download_button("⬇️ Pesos (CSV)", data=reco["weights"].to_csv().encode(),
                                file_name="pesos_portafolio.csv", mime="text/csv")
     if REPORTLAB_OK:
-        pm = compute_portfolio_metrics_from_reco(rets_df_corr, reco, trading_days)
+        pm = compute_portfolio_metrics_from_reco(rets_df_corr, reco, trading_days, min_obs=corr_min_periods)
         pdf_bytes = make_pdf_report(
             "MT5 Trading Lab — Reporte Ejecutivo", str(start), str(end),
             symbols, unique_labels, bullets, summary, risk_df, week_sev, reco, pm)
@@ -2398,7 +2528,7 @@ with tab_port:
     if rets_df_corr.empty or rets_df_corr.shape[1] < 2:
         st.info("Necesitas 2+ activos con retornos suficientes.")
     else:
-        corrp = rets_df_corr.corr(min_periods=200)
+        corrp = rets_df_corr.corr(min_periods=corr_min_periods)
         cols = list(corrp.columns)
 
         if reco.get("selected"):
@@ -2414,7 +2544,7 @@ with tab_port:
                 st.info("Selecciona al menos 2.")
             else:
                 R = rets_df_corr[selected].dropna(how="any")
-                if R.shape[0] < 200:
+                if R.shape[0] < corr_min_periods:
                     st.warning("Poco traslape. Usa rango común.")
                 else:
                     cov = shrink_cov(R.cov(), lam=0.10, jitter=1e-10)
@@ -2441,10 +2571,39 @@ with tab_port:
 # ── Tab: Correlación ─────────────────────────────────────────────────────────
 with tab_corr:
     st.subheader("🔗 Correlación")
+
+    if corr_daily_mode:
+        _why = "; ".join(corr_daily_reason) if corr_daily_reason else "alineación diaria activada"
+        st.info(
+            "📅 Para correlación/portafolio se alinearon retornos a 1D (por día calendario). "
+            f"Motivo: {_why}."
+        )
+
+    with st.expander("🧪 Debug de carga y traslape", expanded=False):
+        if hasattr(st.session_state, "meta_df") and not st.session_state.meta_df.empty:
+            st.markdown("**Procesado de archivos (antes del filtro de fechas)**")
+            st.dataframe(st.session_state.meta_df, use_container_width=True)
+        if debug_corr is not None and not getattr(debug_corr, "empty", True):
+            st.markdown("**En rango seleccionado (lo que realmente entra al análisis)**")
+            st.dataframe(debug_corr, use_container_width=True)
+
+        if not rets_df_corr.empty and rets_df_corr.shape[1] >= 2:
+            _m = rets_df_corr.notna().astype(int)
+            _ov = _m.T @ _m
+            st.markdown("**Traslape (# puntos comunes por par)**")
+            st.dataframe(_ov, use_container_width=True)
+            _off = _ov.values[np.triu_indices_from(_ov.values, 1)]
+            if _off.size:
+                st.caption(
+                    f"Mediana traslape: {int(np.nanmedian(_off))} | "
+                    f"Mínimo: {int(np.nanmin(_off))} | "
+                    f"min_periods={corr_min_periods}"
+                )
+
     if rets_df_corr.empty or rets_df_corr.shape[1] < 2:
         st.info("Necesitas 2+ símbolos.")
     else:
-        corr2 = rets_df_corr.corr(min_periods=200)
+        corr2 = rets_df_corr.corr(min_periods=corr_min_periods)
         st.plotly_chart(safe_imshow(corr2, "Matriz de correlación"), use_container_width=True)
 
         cols = list(rets_df_corr.columns)
