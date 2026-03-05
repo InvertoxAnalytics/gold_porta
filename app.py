@@ -758,6 +758,8 @@ def drawdown_events(
     ev["Peak"] = pd.to_datetime(ev["Peak"])
     ev["Trough"] = pd.to_datetime(ev["Trough"])
     ev["Recovery"] = pd.to_datetime(ev["Recovery"])
+    ev["Caída $"] = ev["Peak High"] - ev["Trough Low"]
+    ev["Caída %"] = ev["Caída $"] / ev["Peak High"].replace(0, np.nan)
     ev["Dur Peak->Trough"] = ev["Trough"] - ev["Peak"]
     ev["Dur Trough->Recovery"] = ev["Recovery"] - ev["Trough"]
     ev["Dur Peak->Recovery"] = ev["Recovery"] - ev["Peak"]
@@ -2663,10 +2665,17 @@ if not SIMPLE:
 
         ev = drawdown_events(df[["High", "Low"]], min_new_high=min_new_high, min_dd=min_dd_event)
         st.markdown(f"### Top {top_dd} drawdowns")
-        cols_dd = ["Peak", "Trough", "Recovery", "Peak High", "Trough Low", "DD%",
+        cols_dd = ["Peak", "Trough", "Recovery", "Peak High", "Trough Low", "DD%", "Caída $", "Caída %",
                    "Dur Peak->Trough", "Dur Trough->Recovery", "Dur Peak->Recovery"]
-        st.dataframe(ev[cols_dd].head(top_dd) if not ev.empty else pd.DataFrame(),
-                     use_container_width=True)
+        if ev.empty:
+            st.dataframe(pd.DataFrame(), use_container_width=True)
+        else:
+            ev_show = ev[cols_dd].head(top_dd).copy()
+            for c in ["Peak High", "Trough Low", "Caída $"]:
+                ev_show[c] = ev_show[c].map(lambda x: fmt_num(float(x), 2) if pd.notna(x) else "—")
+            ev_show["DD%"] = ev_show["DD%"].map(lambda x: fmt_pct(float(x), 2) if pd.notna(x) else "—")
+            ev_show["Caída %"] = ev_show["Caída %"].map(lambda x: fmt_pct(float(x), 2) if pd.notna(x) else "—")
+            st.dataframe(ev_show, use_container_width=True)
 
     # Tab: Par Óptimo
     with tab_gs:
